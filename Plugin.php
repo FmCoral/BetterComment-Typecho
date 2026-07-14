@@ -60,11 +60,12 @@ class Plugin implements PluginInterface
             'apiProvider',
             [
                 'ip-api'   => _t('ip-api.com（国际，中英文）'),
-                'pconline' => _t('太平洋 pconline（国内，纯中文）'),
+                'pconline' => _t('太平洋 pconline（国内，JSON）'),
+                'ipshudi'  => _t('ipshudi（国内，HTML 抓取）'),
             ],
             'ip-api',
             _t('IP 查询服务'),
-            _t('国内推荐太平洋，纯中文 JSON 返回且免费；海外选 ip-api.com。')
+            _t('三个免费 API 可选，国内推荐太平洋或 ipshudi。')
         );
         $form->addInput($apiProvider);
     }
@@ -198,7 +199,13 @@ class Plugin implements PluginInterface
         $location = '未知';
         try {
             $provider = self::getApiProvider();
-            $result = $provider === 'pconline' ? self::queryPconline($ip) : self::queryIpApi($ip);
+            if ($provider === 'pconline') {
+                $result = self::queryPconline($ip);
+            } elseif ($provider === 'ipshudi') {
+                $result = self::queryIpShudi($ip);
+            } else {
+                $result = self::queryIpApi($ip);
+            }
             if ($result) $location = $result;
         } catch (\Exception $e) {}
 
@@ -277,6 +284,34 @@ class Plugin implements PluginInterface
     }
 
     /**
+     * 调用 ipshudi 在线查询 IP 位置（HTML 页面抓取）
+     */
+    private static function queryIpShudi($ip)
+    {
+        $url = 'https://www.ipshudi.com/' . urlencode($ip) . '.htm';
+        $ctx = stream_context_create([
+            'http' => [
+                'timeout' => 3,
+                'header'  => "User-Agent: Mozilla/5.0\r\n",
+            ],
+        ]);
+        $html = @file_get_contents($url, false, $ctx);
+        if (!$html) return '';
+
+        $location = '';
+        if (preg_match('#<td class="th">归属地</td>\s*<td>\s*<span>([^<]+)</span>#i', $html, $m)) {
+            $location = trim($m[1]);
+        }
+        if (preg_match('#<td class="th">运营商</td>\s*<td>\s*<span>([^<]+)</span>#i', $html, $m)) {
+            $isp = trim($m[1]);
+            if ($isp !== '' && !in_array($isp, ['-', '未知'])) {
+                $location .= ' ' . $isp;
+            }
+        }
+        return $location;
+    }
+
+    /**
      * 读取用户选择的 IP API 提供商
      */
     private static function getApiProvider()
@@ -292,7 +327,7 @@ class Plugin implements PluginInterface
             $val = $config['apiProvider'] ?? 'ip-api';
             // 兼容 Typecho 可能将 Radio 值存为数组的情况
             if (is_array($val)) $val = implode('', $val);
-            $provider = in_array($val, ['ip-api', 'pconline'], true) ? $val : 'ip-api';
+            $provider = in_array($val, ['ip-api', 'pconline', 'ipshudi'], true) ? $val : 'ip-api';
         }
         return $provider;
     }
