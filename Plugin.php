@@ -59,12 +59,12 @@ class Plugin implements PluginInterface
         $apiProvider = new Radio(
             'apiProvider',
             [
-                'ip-api'  => _t('ip-api.com（国际，JSON API）'),
-                'ipshudi' => _t('ipshudi（国内，纯中文，免费）'),
+                'ip-api'   => _t('ip-api.com（国际，中英文）'),
+                'pconline' => _t('太平洋 pconline（国内，纯中文）'),
             ],
             'ip-api',
             _t('IP 查询服务'),
-            _t('国内推荐 ipshudi，纯中文结果且免费；海外或需英文结果选 ip-api.com。')
+            _t('国内推荐太平洋，纯中文 JSON 返回且免费；海外选 ip-api.com。')
         );
         $form->addInput($apiProvider);
     }
@@ -198,7 +198,7 @@ class Plugin implements PluginInterface
         $location = '未知';
         try {
             $provider = self::getApiProvider();
-            $result = $provider === 'ipshudi' ? self::queryIpShudi($ip) : self::queryIpApi($ip);
+            $result = $provider === 'pconline' ? self::queryPconline($ip) : self::queryIpApi($ip);
             if ($result) $location = $result;
         } catch (\Exception $e) {}
 
@@ -241,37 +241,39 @@ class Plugin implements PluginInterface
     }
 
     /**
-     * 调用 ipshudi 在线查询 IP 位置（HTML 页面抓取）
+     * 调用 pconline（太平洋网络）在线查询 IP 位置
      *
-     * 免费、UTF-8、纯中文。从 htm 页面提取归属地+运营商。
+     * JSON 返回，GBK 编码需转 UTF-8。国内 IP 精确，免费。
      */
-    private static function queryIpShudi($ip)
+    private static function queryPconline($ip)
     {
-        $url = 'https://www.ipshudi.com/' . urlencode($ip) . '.htm';
-        $ctx = stream_context_create([
-            'http' => [
-                'timeout' => 3,
-                'header'  => "User-Agent: Mozilla/5.0\r\n",
-            ],
-        ]);
-        $html = @file_get_contents($url, false, $ctx);
-        if (!$html) return '';
+        $url = 'https://whois.pconline.com.cn/ipJson.jsp?ip=' . urlencode($ip) . '&json=true';
+        $ctx = stream_context_create(['http' => ['timeout' => 2]]);
+        $json = @file_get_contents($url, false, $ctx);
+        if (!$json) return '';
 
-        // 提取归属地
-        if (!preg_match('#<td class="th">归属地</td>\s*<td>\s*<span>([^<]+)</span>#i', $html, $m)) {
-            return '';
+        // GBK → UTF-8
+        $json = mb_convert_encoding($json, 'UTF-8', 'GBK');
+        $data = json_decode($json, true);
+        if (!$data) return '';
+
+        // 优先 pro + city
+        $parts = [];
+        if (!empty($data['pro']))  $parts[] = $data['pro'];
+        if (!empty($data['city']) && $data['city'] !== $data['pro']) {
+            $parts[] = $data['city'];
         }
-        $location = trim($m[1]);
 
-        // 附加运营商
-        if (preg_match('#<td class="th">运营商</td>\s*<td>\s*<span>([^<]+)</span>#i', $html, $m2)) {
-            $isp = trim($m2[1]);
-            if ($isp !== '' && !in_array($isp, ['-', '未知'])) {
-                $location .= ' ' . $isp;
+        // 后备：addr 去掉运营商后缀
+        if (empty($parts) && !empty($data['addr'])) {
+            $addr = trim($data['addr']);
+            if ($addr && !in_array($addr, ['局域网', '本机地址', '保留地址'])) {
+                $addrClean = preg_replace('/\s+\S+$/', '', $addr);
+                $parts[] = $addrClean ?: $addr;
             }
         }
 
-        return $location;
+        return $parts ? implode(' ', $parts) : '';
     }
 
     /**
@@ -290,7 +292,7 @@ class Plugin implements PluginInterface
             $val = $config['apiProvider'] ?? 'ip-api';
             // 兼容 Typecho 可能将 Radio 值存为数组的情况
             if (is_array($val)) $val = implode('', $val);
-            $provider = in_array($val, ['ip-api', 'ipshudi'], true) ? $val : 'ip-api';
+            $provider = in_array($val, ['ip-api', 'pconline'], true) ? $val : 'ip-api';
         }
         return $provider;
     }
