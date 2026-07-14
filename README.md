@@ -1,31 +1,33 @@
-# CommentAvatar — 评论头像自动解析
+# CommentAvatar — 评论头像 + IP 属地
 
-Typecho 插件：根据评论者邮箱自动替换头像。QQ 邮箱使用 QQ 个性头像，其他邮箱随机匹配预设头像。
+Typecho 插件：QQ 邮箱自动使用 QQ 头像，其他邮箱随机匹配预设头像，评论旁显示 IP 地理位置。
 
 ## 功能
 
-| 邮箱类型 | 头像来源 |
-|----------|----------|
-| QQ 邮箱（`数字@qq.com`） | QQ 官方头像 CDN（`q1.qlogo.cn`） |
-| 其他邮箱 | 插件 `avatars/` 文件夹随机匹配（确定性分配） |
-| 降级（无水龙头像文件） | 动态生成 SVG 首字母头像 |
+| 功能 | 说明 |
+|------|------|
+| 🎨 头像解析 | QQ 邮箱 → QQ 头像 CDN；其他邮箱 → `avatars/` 随机匹配 |
+| 🌍 IP 属地 | 评论头像旁显示 IP 地理位置（如"广东 · 深圳"） |
+| 🔀 双 API | ip-api.com / pconline（太平洋）可选，国内推荐太平洋 |
 
 ## 安装
 
-1. 将 `CommentAvatar` 文件夹上传到 `usr/plugins/`
+1. 将 `CommentAvatar` 上传到 `usr/plugins/`
 2. 后台 → 控制台 → 插件 → 启用 **CommentAvatar**
-3. 无需配置，立即生效
+3. 进入设置页勾选"显示评论 IP 属地"并选择查询服务
+
+## 配置
+
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| 显示评论 IP 属地 | 启用 | 头像旁显示发评论者的地理位置 |
+| IP 查询服务 | ip-api.com | ip-api.com（国际）/ pconline（国内·中文·快） |
+
+> 💡 若已安装 IpAccessLog 插件，CommentAvatar 会直接复用其 IP 缓存，无需额外配置。
 
 ## 自定义头像
 
-替换 `avatars/` 中的 SVG 文件即可，支持 `.svg` `.png` `.jpg` `.gif` `.webp`，建议 100×100 像素。
-
-## 实现原理
-
-- 钩子：`Widget\Base\Comments->gravatar`
-- QQ 邮箱正则 `/^\d+@qq\.com$/i` → `q1.qlogo.cn/g?b=qq&nk={QQ}&s=100`
-- 非 QQ 邮箱 `crc32(email) % N` → 确定性选取头像文件
-- 无水龙头像时动态生成 HSL 配色 + 首字母 SVG Data URI
+替换 `avatars/` 中的文件，支持 `.svg` `.png` `.jpg` `.gif` `.webp`，建议 100×100 像素。
 
 ## 许可
 
