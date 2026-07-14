@@ -59,12 +59,12 @@ class Plugin implements PluginInterface
         $apiProvider = new Radio(
             'apiProvider',
             [
-                'ip-api'  => _t('ip-api.com（国际，支持中英文城市名）'),
-                'pconline' => _t('太平洋 pconline（国内，纯中文，速度快）'),
+                'ip-api' => _t('ip-api.com（国际，支持中英文）'),
+                'ipcn'   => _t('ip.cn（国内，纯中文，速度快）'),
             ],
             'ip-api',
             _t('IP 查询服务'),
-            _t('选择 IP 地理位置查询服务商。国内访问推荐太平洋，解析更精确；海外或需英文结果选 ip-api.com。')
+            _t('国内推荐 ip.cn，纯中文结果且速度更快；海外或需英文结果选 ip-api.com。')
         );
         $form->addInput($apiProvider);
     }
@@ -198,7 +198,7 @@ class Plugin implements PluginInterface
         $location = '未知';
         try {
             $provider = self::getApiProvider();
-            $result = $provider === 'pconline' ? self::queryPconline($ip) : self::queryIpApi($ip);
+            $result = $provider === 'ipcn' ? self::queryIpCn($ip) : self::queryIpApi($ip);
             if ($result) $location = $result;
         } catch (\Exception $e) {}
 
@@ -241,35 +241,23 @@ class Plugin implements PluginInterface
     }
 
     /**
-     * 调用 pconline（太平洋网络）在线查询
+     * 调用 ip.cn 在线查询 IP 位置
      *
-     * 返回中文省/市，GBK 编码需转 UTF-8。
+     * 返回中文地址，UTF-8 编码。
      */
-    private static function queryPconline($ip)
+    private static function queryIpCn($ip)
     {
-        $url = 'https://whois.pconline.com.cn/ipJson.jsp?ip=' . urlencode($ip) . '&json=true';
+        $url = 'https://www.ip.cn/api/index?ip=' . urlencode($ip) . '&type=1';
         $ctx = stream_context_create(['http' => ['timeout' => 2]]);
         $json = @file_get_contents($url, false, $ctx);
         if (!$json) return '';
 
-        // pconline 返回 GBK 编码，需转换
-        $json = mb_convert_encoding($json, 'UTF-8', 'GBK');
         $data = json_decode($json, true);
-        if (!$data || !empty($data['err'])) return '';
+        if (!$data || empty($data['rs']) || !empty($data['code'])) return '';
 
-        $parts = [];
-        if (!empty($data['pro']))  $parts[] = $data['pro'];
-        if (!empty($data['city'])) $parts[] = $data['city'];
-        // addr 包含详细地址，作为后备
-        if (empty($parts) && !empty($data['addr'])) {
-            // addr 格式：局域网 或 中国北京市 等
-            $addr = trim($data['addr']);
-            if ($addr && !in_array($addr, ['局域网', '本机地址', '保留地址'])) {
-                $parts[] = $addr;
-            }
-        }
-
-        return implode(' ', $parts);
+        // address 格式: "中国  江苏省 苏州市  电信"
+        $address = trim($data['address'] ?? '');
+        return $address ? preg_replace('/\s+/', ' ', $address) : '';
     }
 
     /**
@@ -288,7 +276,7 @@ class Plugin implements PluginInterface
             $val = $config['apiProvider'] ?? 'ip-api';
             // 兼容 Typecho 可能将 Radio 值存为数组的情况
             if (is_array($val)) $val = implode('', $val);
-            $provider = in_array($val, ['ip-api', 'pconline'], true) ? $val : 'ip-api';
+            $provider = in_array($val, ['ip-api', 'ipcn'], true) ? $val : 'ip-api';
         }
         return $provider;
     }
