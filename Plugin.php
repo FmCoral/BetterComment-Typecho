@@ -291,7 +291,7 @@ class Plugin implements PluginInterface
         $url = 'https://www.ipshudi.com/' . urlencode($ip) . '.htm';
         $ctx = stream_context_create([
             'http' => [
-                'timeout' => 3,
+                'timeout' => 5,
                 'header'  => "User-Agent: Mozilla/5.0\r\n",
             ],
         ]);
