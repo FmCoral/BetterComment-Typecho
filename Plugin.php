@@ -2,7 +2,6 @@
 /**
  * BetterComment — 全能评论增强插件（头像 / IP 属地 / 邮件通知 / 找回密码）
  *
- * 整合自 LoveKKComment (康粑粑) 与 CommentAvatar (FmCoral)
  *
  * - 头像：QQ 邮箱自动用 QQ 头像，其他邮箱随机匹配预设头像
  * - IP 属地：评论旁显示 IP 地理位置（ip-api.com / pconline 双 API）
@@ -775,10 +774,12 @@ EOS);
         $options = \Helper::options();
         $plugin  = $options->plugin('BetterComment');
 
-        // 获取关联文章标题，构建永久链接
+        // 获取关联文章，用 Typecho 实际路由生成正确链接
         $post  = self::fetchRow('contents', 'cid', $comment['cid']);
         $title = $post['title'] ?? '';
-        $permalink = trim($options->siteUrl) . '/archive/' . ($post['slug'] ?? $comment['cid']) . '/';
+        $postUrl = self::getContentUrl($post, $options);
+        $commentUrl = $postUrl . '#comment-' . $comment['coid'];
+        $permalink  = $postUrl;
 
         // 确定收件人
         $address       = $comment['mail'];
@@ -832,7 +833,7 @@ EOS);
                     trim($parentComment['author'] ?? ''), trim($permalink),
                     trim($title), trim($parentComment['text'] ?? ''),
                     trim($comment['author'] ?? ''), trim($comment['text'] ?? ''),
-                    trim($permalink),
+                    trim($commentUrl),
                 ],
                 $html
             );
@@ -1105,6 +1106,36 @@ EOS);
         } catch (\Exception $e) {
             return null;
         }
+    }
+
+    // =========================================================================
+    //  内容链接生成
+    // =========================================================================
+
+    /**
+     * 根据 Typecho 路由表生成内容页面的正确链接
+     *
+     * @param array $post    contents 表行数据（需含 cid, slug, type, created 等）
+     * @param mixed $options 站点选项对象
+     * @return string
+     */
+    private static function getContentUrl(array $post, $options): string
+    {
+        $type = $post['type'] ?? 'post';
+
+        // 页面：用 slug 生成 /{slug}.html
+        if ('page' === $type) {
+            if (null !== \Typecho\Router::get('page')) {
+                return \Typecho\Router::url('page', ['slug' => $post['slug'] ?? ''], $options->siteUrl);
+            }
+            return \Typecho\Common::url('/' . ($post['slug'] ?? '') . '.html', $options->siteUrl);
+        }
+
+        // 文章：用 cid 生成 /archives/{cid}/
+        if (null !== \Typecho\Router::get('post')) {
+            return \Typecho\Router::url('post', ['cid' => $post['cid'] ?? 0], $options->siteUrl);
+        }
+        return \Typecho\Common::url('/archives/' . ($post['cid'] ?? 0) . '/', $options->siteUrl);
     }
 
     // =========================================================================
