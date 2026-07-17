@@ -1,6 +1,6 @@
 # BetterComment — 全能评论增强插件
 
-整合自 LoveKKComment（康粑粑）与 CommentAvatar（FmCoral），Typecho 全能评论增强插件。
+Typecho 全能评论增强插件。
 
 ## 功能一览
 
