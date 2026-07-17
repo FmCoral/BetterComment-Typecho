@@ -1,18 +1,21 @@
 <?php
 /**
- * 评论头像自动解析 + IP 属地显示插件
+ * BetterComment — 全能评论增强插件（头像 / IP 属地 / 邮件通知 / 找回密码）
  *
- *   - QQ 邮箱（数字@qq.com）：自动使用 QQ 头像
- *   - 非 QQ 邮箱：从插件 avatars/ 文件夹随机选取头像
- *   - IP 属地：评论旁显示发评论者的 IP 地理位置（ip-api.com / pconline 双 API 可选）
+ * 整合自 LoveKKComment (康粑粑) 与 CommentAvatar (FmCoral)
  *
- * @package CommentAvatar
- * @author FmCoral
- * @version 1.3.1
- * @link https://github.com/FmCoral
+ * - 头像：QQ 邮箱自动用 QQ 头像，其他邮箱随机匹配预设头像
+ * - IP 属地：评论旁显示 IP 地理位置（ip-api.com / pconline 双 API）
+ * - 邮件通知：评论时通知文章作者、被回复者；审核通过通知评论者
+ * - 找回密码：登录页"忘记密码"链接，邮件重置密码
+ *
+ * @package BetterComment
+ * @author  FmCoral
+ * @version 1.0.0
+ * @link    https://github.com/FmCoral/BetterComment-Typecho
  */
 
-namespace TypechoPlugin\CommentAvatar;
+namespace TypechoPlugin\BetterComment;
 
 if (!defined('__TYPECHO_ROOT_DIR__')) {
     exit;
@@ -22,6 +25,11 @@ use Typecho\Plugin\PluginInterface;
 use Typecho\Widget\Helper\Form;
 use Typecho\Widget\Helper\Form\Element\Checkbox;
 use Typecho\Widget\Helper\Form\Element\Radio;
+use Typecho\Widget\Helper\Form\Element\Text;
+use Typecho\Widget\Helper\Form\Element\Select;
+use Typecho\Widget\Helper\Form\Element\Hidden;
+use Typecho\Widget\Helper\Form\Element\Submit;
+use Typecho\Widget\Helper\Layout;
 use Widget\Options;
 
 class Plugin implements PluginInterface
@@ -32,30 +40,59 @@ class Plugin implements PluginInterface
 
     public static function activate()
     {
+        // 检查 CURL（邮件发送必需）
+        if (!function_exists('curl_init')) {
+            throw new \Typecho\Plugin\Exception(_t('对不起，使用邮件发送功能必须要支持 CURL'));
+        }
+
+        // === 头像 / IP 属地钩子 ===
         \Typecho\Plugin::factory('Widget\Base\Comments')->gravatar = [__CLASS__, 'renderAvatar'];
+
+        // === 邮件通知钩子 ===
+        \Typecho\Plugin::factory('Widget\Feedback')->finishComment = [__CLASS__, 'doComment'];
+        \Typecho\Plugin::factory('Widget\Comments\Edit')->finishComment = [__CLASS__, 'doComment'];
+        \Typecho\Plugin::factory('Widget\Comments\Edit')->mark = [__CLASS__, 'doApproved'];
+
+        // === 找回密码钩子 ===
+        \Typecho\Plugin::factory('admin/footer.php')->end = [__CLASS__, 'forgetLink'];
+        \Helper::addAction('commentavatar', 'TypechoPlugin\BetterComment\Action');
+        \Helper::addRoute('commentavatar_forget', '/commentavatar/forget', 'TypechoPlugin\BetterComment\Action', 'forget');
+        \Helper::addRoute('commentavatar_reset', '/commentavatar/reset', 'TypechoPlugin\BetterComment\Action', 'reset');
 
         // 确保资源目录存在
         foreach (['avatars', 'cache'] as $sub) {
             $dir = __DIR__ . '/' . $sub;
-            if (!is_dir($dir)) @mkdir($dir, 0755, true);
+            if (!is_dir($dir)) {
+                @mkdir($dir, 0755, true);
+            }
         }
     }
 
-    public static function deactivate() {}
+    public static function deactivate()
+    {
+        \Helper::removeAction('commentavatar');
+        \Helper::removeRoute('commentavatar_forget');
+        \Helper::removeRoute('commentavatar_reset');
+    }
 
     public static function config(Form $form)
     {
-        // IP 属地显示开关
+        // =====================================================================
+        //  1. IP 属地设置
+        // =====================================================================
+        $section1 = new Layout('div', ['class' => 'typecho-page-title']);
+        $section1->html('<h2>🌍 IP 属地显示</h2>');
+        $form->addItem($section1);
+
         $showLocation = new Checkbox(
             'showLocation',
             ['enable' => _t('显示评论 IP 属地')],
             ['enable'],
             _t('IP 属地显示'),
-            _t('启用后在每条评论头像旁显示发评论者的 IP 地理位置（如"广东 · 深圳"）。')
+            _t('启用后在每条评论头像旁显示 IP 地理位置（如"广东 · 深圳"）。')
         );
         $form->addInput($showLocation);
 
-        // IP 查询 API 选择
         $apiProvider = new Radio(
             'apiProvider',
             [
@@ -68,12 +105,301 @@ class Plugin implements PluginInterface
             _t('三个免费 API 可选，国内推荐太平洋或 ipshudi。')
         );
         $form->addInput($apiProvider);
+
+        // =====================================================================
+        //  2. 邮件发送 — 公共配置
+        // =====================================================================
+        $section2 = new Layout('div', ['class' => 'typecho-page-title']);
+        $section2->html('<h2>📧 邮件通知设置</h2>');
+        $form->addItem($section2);
+
+        $public_interface = new Radio(
+            'public_interface',
+            [
+                'smtp'     => _t('SMTP'),
+                'sendcloud' => _t('Send Cloud'),
+                'aliyun'   => _t('阿里云推送'),
+            ],
+            null,
+            _t('发信接口')
+        );
+        $form->addInput($public_interface->addRule('required', _t('请选择发件接口')));
+
+        $public_name = new Text(
+            'public_name', null, null,
+            _t('发件人名称'),
+            _t('邮件中显示的发信人名称，留空为博客名称')
+        );
+        $form->addInput($public_name);
+
+        $public_mail = new Text(
+            'public_mail', null, null,
+            _t('发件邮箱地址'),
+            _t('邮件中显示的发信地址')
+        );
+        $form->addInput($public_mail->addRule('required', _t('请输入发件邮箱地址'))->addRule('email', _t('请输入正确的邮箱地址')));
+
+        $public_replyto = new Text(
+            'public_replyto', null, null,
+            _t('邮件回复地址'),
+            _t('附带在邮件中的默认回信地址')
+        );
+        $form->addInput($public_replyto->addRule('required', _t('请输入回信邮箱地址'))->addRule('email', _t('请输入正确的邮箱地址')));
+
+        $public_debug = new Checkbox(
+            'public_debug',
+            ['enable' => _t('启用 Debug')],
+            ['enable'],
+            _t('Debug 模式'),
+            _t('启用后将在插件目录生成 debug.txt 文件，记录邮件发送详细错误')
+        );
+        $form->addInput($public_debug);
+
+        $public_verify = new Checkbox(
+            'public_verify',
+            ['enable' => _t('启用配置验证')],
+            ['enable'],
+            _t('配置验证'),
+            _t('保存配置时验证 SMTP 连接 / SendCloud API 是否正确。启用后可能导致配置保存速度缓慢。使用 SSL 465 端口可能导致验证失败，建议使用 TLS 587 端口。')
+        );
+        $form->addInput($public_verify);
+
+        // =====================================================================
+        //  3. SMTP 设置
+        // =====================================================================
+        $section3 = new Layout('div', ['class' => 'typecho-page-title', 'data-interface-group' => 'smtp']);
+        $section3->html('<h2>🔐 SMTP 邮件发送设置</h2>');
+        $form->addItem($section3);
+
+        $smtp_host = new Text('smtp_host', null, null, _t('SMTP 地址'), _t('SMTP 服务器连接地址'));
+        $form->addInput($smtp_host);
+
+        $smtp_port = new Text('smtp_port', null, null, _t('SMTP 端口'), _t('SMTP 服务器连接端口'));
+        $form->addInput($smtp_port);
+
+        $smtp_user = new Text('smtp_user', null, null, _t('SMTP 登录用户'), _t('SMTP 登录用户名，一般为邮箱地址'));
+        $form->addInput($smtp_user);
+
+        $smtp_pass = new Text('smtp_pass', null, null, _t('SMTP 登录密码'), _t('一般为邮箱密码，某些服务商需生成专用密码'));
+        $form->addInput($smtp_pass);
+
+        $smtp_auth = new Checkbox(
+            'smtp_auth',
+            ['enable' => _t('服务器需要验证')],
+            ['enable'],
+            _t('SMTP 验证模式')
+        );
+        $form->addInput($smtp_auth);
+
+        $smtp_secure = new Radio(
+            'smtp_secure',
+            [
+                'none' => _t('无安全加密'),
+                'ssl'  => _t('SSL 加密'),
+                'tls'  => _t('TLS 加密'),
+            ],
+            'none',
+            _t('SMTP 加密模式')
+        );
+        $form->addInput($smtp_secure);
+
+        // =====================================================================
+        //  4. SendCloud 设置
+        // =====================================================================
+        $section4 = new Layout('div', ['class' => 'typecho-page-title', 'data-interface-group' => 'sendcloud']);
+        $section4->html('<h2>☁️ Send Cloud 设置</h2>');
+        $form->addItem($section4);
+
+        $sendcloud_api_user = new Text('sendcloud_api_user', null, null, _t('API USER'), _t('请填入在 SendCloud 生成的 API_USER'));
+        $form->addInput($sendcloud_api_user);
+
+        $sendcloud_api_key = new Text('sendcloud_api_key', null, null, _t('API KEY'), _t('请填入在 SendCloud 生成的 API_KEY'));
+        $form->addInput($sendcloud_api_key);
+
+        // =====================================================================
+        //  5. 阿里云推送设置
+        // =====================================================================
+        $section5 = new Layout('div', ['class' => 'typecho-page-title', 'data-interface-group' => 'aliyun']);
+        $section5->html('<h2>🎯 阿里云推送设置</h2>');
+        $form->addItem($section5);
+
+        $ali_region = new Select(
+            'ali_region',
+            [
+                'hangzhou'  => _t('华东 1（杭州）'),
+                'singapore' => _t('亚太东南 1（新加坡）'),
+                'sydney'    => _t('亚太东南 2（悉尼）'),
+            ],
+            null,
+            _t('DM 接入区域'),
+            _t('请选择您的邮件推送所在服务器区域')
+        );
+        $form->addInput($ali_region);
+
+        $ali_accesskey_id = new Text('ali_accesskey_id', null, null, _t('AccessKey ID'), _t('请填入在阿里云生成的 AccessKey ID'));
+        $form->addInput($ali_accesskey_id);
+
+        $ali_accesskey_secret = new Text('ali_accesskey_secret', null, null, _t('Access Key Secret'), _t('请填入在阿里云生成的 Access Key Secret'));
+        $form->addInput($ali_accesskey_secret);
+
+        // =====================================================================
+        //  6. 找回密码设置
+        // =====================================================================
+        $section6 = new Layout('div', ['class' => 'typecho-page-title']);
+        $section6->html('<h2>🔑 找回密码设置</h2>');
+        $form->addItem($section6);
+
+        $public_forget = new Checkbox(
+            'public_forget',
+            ['enable' => _t('启用找回密码')],
+            ['enable'],
+            _t('找回密码'),
+            _t('启用后，登录界面将出现"忘记密码"链接，通过邮件重置密码')
+        );
+        $form->addInput($public_forget);
+
+        $public_expire = new Text(
+            'public_expire', null, '10',
+            _t('验证过期时间（分钟）'),
+            _t('找回密码链接的有效时间，单位为分钟')
+        );
+        $form->addInput($public_expire);
+
+        // =====================================================================
+        //  JS：根据选中的发信接口动态显示/隐藏对应设置区块
+        // =====================================================================
+        $js = new Layout('div');
+        $js->html(<<<EOS
+<script>
+(function() {
+    var toggleInterface = function(selected) {
+        document.querySelectorAll('[data-interface-group]').forEach(function(heading) {
+            var iface = heading.getAttribute('data-interface-group');
+            var show  = (iface === selected);
+            heading.style.display = show ? '' : 'none';
+            // 隐藏/显示后续元素，遇到任意 typecho-page-title 就停止（保护找回密码区域和保存按钮）
+            var el = heading.nextElementSibling;
+            while (el && !el.classList.contains('typecho-page-title')) {
+                el.style.display = show ? '' : 'none';
+                el = el.nextElementSibling;
+            }
+        });
+    };
+
+    var radios = document.querySelectorAll('input[name="public_interface"]');
+    radios.forEach(function(r) {
+        r.addEventListener('change', function() {
+            if (this.checked) toggleInterface(this.value);
+        });
+    });
+
+    var checked = document.querySelector('input[name="public_interface"]:checked');
+    toggleInterface(checked ? checked.value : 'none');
+})();
+</script>
+EOS);
+        $form->addItem($js);
     }
 
     public static function personalConfig(Form $form) {}
 
+    /**
+     * 保存配置时自动验证
+     */
+    public static function configCheck(array $settings)
+    {
+        $options = \Helper::options();
+        $plugin  = $options->plugin('BetterComment');
+
+        if (!in_array('enable', $plugin->public_verify)) {
+            return;
+        }
+
+        switch ($settings['public_interface']) {
+            case 'sendcloud':
+                if (empty($settings['sendcloud_api_user']) || empty($settings['sendcloud_api_key'])) {
+                    return _t('Send Cloud API USER 与 API KEY 必须填写');
+                }
+                $url = 'http://api.sendcloud.net/apiv2/apiuser/list?apiUser='
+                     . $settings['sendcloud_api_user'] . '&apiKey=' . $settings['sendcloud_api_key'];
+                $ch = curl_init();
+                curl_setopt($ch, CURLOPT_URL, $url);
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+                $result = curl_exec($ch);
+                curl_close($ch);
+                $result = json_decode($result);
+                if (200 != $result->statusCode) {
+                    return _t($result->message);
+                }
+                break;
+
+            case 'aliyun':
+                if (empty($settings['ali_region']) || empty($settings['ali_accesskey_id']) || empty($settings['ali_accesskey_secret'])) {
+                    return _t('阿里云接入区域、AccessKey ID、Access Key Secret 必须填写');
+                }
+                break;
+
+            default: // SMTP
+                if (empty($settings['smtp_host'])) {
+                    return _t('SMTP 地址必须填写');
+                }
+                if (empty($settings['smtp_port'])) {
+                    return _t('SMTP 端口必须填写');
+                }
+                if (!class_exists('PHPMailer\PHPMailer\SMTP')) {
+                    require __DIR__ . '/lib/SMTP.php';
+                }
+                $smtp = new \PHPMailer\PHPMailer\SMTP();
+
+                $hostname = 'localhost.localdomain';
+                if (isset($_SERVER) && array_key_exists('SERVER_NAME', $_SERVER) && !empty($_SERVER['SERVER_NAME'])) {
+                    $hostname = $_SERVER['SERVER_NAME'];
+                } elseif (function_exists('gethostname') && gethostname() !== false) {
+                    $hostname = gethostname();
+                } elseif (php_uname('n') !== false) {
+                    $hostname = php_uname('n');
+                }
+
+                if (!$smtp->connect($settings['smtp_host'], $settings['smtp_port'], 5)) {
+                    return _t('SMTP 连接失败，请检查 SMTP 地址及端口');
+                }
+                if (!$smtp->hello($hostname)) {
+                    return _t('SMTP 发送 EHLO 指令失败：' . $smtp->getError()['error']
+                        . '。若使用 SSL 465 端口可能导致此错误，建议更换 TLS 587 端口');
+                }
+
+                $e = $smtp->getServerExtList();
+                if (is_array($e) && array_key_exists('STARTTLS', $e)) {
+                    if ('tls' != $settings['smtp_secure']) {
+                        return _t('SMTP 服务器要求 tls 加密');
+                    }
+                    if (!$smtp->startTLS()) {
+                        return _t('TLS 加密失败：' . $smtp->getError()['error']);
+                    }
+                    if (!$smtp->hello($hostname)) {
+                        return _t('TLS 后 EHLO 失败：' . $smtp->getError()['error']);
+                    }
+                    $e = $smtp->getServerExtList();
+                }
+
+                if ((is_array($e) && array_key_exists('AUTH', $e)) || in_array('enable', $settings['smtp_auth'])) {
+                    if (empty($settings['smtp_user']) || empty($settings['smtp_pass'])) {
+                        return _t('SMTP 登录账号及密码不能为空');
+                    }
+                    if (!in_array('enable', $settings['smtp_auth'])) {
+                        return _t('SMTP 服务器要求身份验证');
+                    }
+                    if (!$smtp->authenticate($settings['smtp_user'], $settings['smtp_pass'])) {
+                        return _t('SMTP 登录失败：' . $smtp->getError()['error']);
+                    }
+                }
+                $smtp->quit(true);
+                break;
+        }
+    }
+
     // =========================================================================
-    //  钩子回调
+    //  头像 + IP 属地
     // =========================================================================
 
     /**
@@ -114,10 +440,9 @@ class Plugin implements PluginInterface
         }
     }
 
-    // =========================================================================
-    //  头像选择
-    // =========================================================================
-
+    /**
+     * 根据邮箱哈希选取随机头像
+     */
     private static function getRandomAvatarUrl($email)
     {
         static $avatarList = null;
@@ -135,7 +460,7 @@ class Plugin implements PluginInterface
         }
 
         $index = abs(crc32($email)) % count($avatarList);
-        return \Typecho\Common::url('CommentAvatar/avatars/' . $avatarList[$index], $pluginUrl);
+        return \Typecho\Common::url('BetterComment/avatars/' . $avatarList[$index], $pluginUrl);
     }
 
     private static function listAvatarFiles()
@@ -144,7 +469,11 @@ class Plugin implements PluginInterface
         $files = [];
         if (is_dir($dir)) {
             $glob = glob($dir . '/*.{png,jpg,jpeg,gif,svg,webp}', GLOB_BRACE);
-            if ($glob) foreach ($glob as $f) $files[] = basename($f);
+            if ($glob) {
+                foreach ($glob as $f) {
+                    $files[] = basename($f);
+                }
+            }
         }
         sort($files);
         return $files;
@@ -152,10 +481,10 @@ class Plugin implements PluginInterface
 
     private static function generateSvgDataUri($email)
     {
-        $hash  = md5($email);
-        $hue   = hexdec(substr($hash, 0, 2)) % 360;
-        $sat   = 55 + (hexdec(substr($hash, 2, 2)) % 20);
-        $light = 45 + (hexdec(substr($hash, 4, 2)) % 15);
+        $hash   = md5($email);
+        $hue    = hexdec(substr($hash, 0, 2)) % 360;
+        $sat    = 55 + (hexdec(substr($hash, 2, 2)) % 20);
+        $light  = 45 + (hexdec(substr($hash, 4, 2)) % 15);
         $initial = mb_strtoupper(mb_substr($email, 0, 1));
 
         $svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
@@ -174,19 +503,23 @@ class Plugin implements PluginInterface
     /**
      * 获取 IP 地理位置
      *
-     * 优先复用 IpAccessLog 插件（共享缓存文件），未安装时使用内置查询。
+     * 优先复用 IpAccessLog 插件的缓存，未安装时使用内置查询。
      */
     public static function getIpLocation($ip)
     {
-        if ($ip === 'unknown' || empty($ip)) return '未知';
-        if (self::isPrivateIp($ip)) return '本地网络';
+        if ($ip === 'unknown' || empty($ip)) {
+            return '未知';
+        }
+        if (self::isPrivateIp($ip)) {
+            return '本地网络';
+        }
 
-        // 方式 1：复用 IpAccessLog 插件
+        // 复用 IpAccessLog 插件缓存（如果已安装）
         if (class_exists('\TypechoPlugin\IpAccessLog\Plugin')) {
             return \TypechoPlugin\IpAccessLog\Plugin::getIpLocation($ip);
         }
 
-        // 方式 2：内置查询（读缓存 → API → 写缓存）
+        // 内置查询：读缓存 → API → 写缓存
         $cacheFile = self::getIpCacheFile();
         $cache = [];
         if (file_exists($cacheFile)) {
@@ -206,8 +539,12 @@ class Plugin implements PluginInterface
             } else {
                 $result = self::queryIpApi($ip);
             }
-            if ($result) $location = $result;
-        } catch (\Exception $e) {}
+            if ($result) {
+                $location = $result;
+            }
+        } catch (\Exception $e) {
+            // 静默失败
+        }
 
         // 写缓存（上限 5000 条）
         $cache[$ip] = $location;
@@ -215,63 +552,61 @@ class Plugin implements PluginInterface
             $cache = array_slice($cache, -4000, 4000, true);
         }
         $dir = dirname($cacheFile);
-        if (!is_dir($dir)) @mkdir($dir, 0755, true);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0755, true);
+        }
         @file_put_contents($cacheFile, json_encode($cache, JSON_UNESCAPED_UNICODE), LOCK_EX);
 
         return $location;
     }
 
-    /**
-     * 调用 ip-api.com 在线查询
-     */
     private static function queryIpApi($ip)
     {
         $url = 'http://ip-api.com/json/' . urlencode($ip)
              . '?lang=zh-CN&fields=country,regionName,city,isp';
         $ctx = stream_context_create(['http' => ['timeout' => 2]]);
         $json = @file_get_contents($url, false, $ctx);
-        if (!$json) return '';
+        if (!$json) {
+            return '';
+        }
 
         $data = json_decode($json, true);
-        if (!$data || !isset($data['country'])) return '';
+        if (!$data || !isset($data['country'])) {
+            return '';
+        }
 
         $parts = [];
-        if (!empty($data['country'])) $parts[] = $data['country'];
+        if (!empty($data['country']))    $parts[] = $data['country'];
         if (!empty($data['regionName'])) $parts[] = $data['regionName'];
-        if (!empty($data['city'])) $parts[] = $data['city'];
-        // 可选 ISP（国内显示运营商）
-        if (!empty($data['isp']) && $data['isp'] !== '') {
-            $parts[] = $data['isp'];
-        }
+        if (!empty($data['city']))       $parts[] = $data['city'];
+        if (!empty($data['isp']))        $parts[] = $data['isp'];
 
         return implode(' ', $parts);
     }
 
-    /**
-     * 调用 pconline（太平洋网络）在线查询 IP 位置
-     *
-     * JSON 返回，GBK 编码需转 UTF-8。国内 IP 精确，免费。
-     */
     private static function queryPconline($ip)
     {
         $url = 'https://whois.pconline.com.cn/ipJson.jsp?ip=' . urlencode($ip) . '&json=true';
         $ctx = stream_context_create(['http' => ['timeout' => 2]]);
         $json = @file_get_contents($url, false, $ctx);
-        if (!$json) return '';
+        if (!$json) {
+            return '';
+        }
 
-        // GBK → UTF-8
         $json = mb_convert_encoding($json, 'UTF-8', 'GBK');
         $data = json_decode($json, true);
-        if (!$data) return '';
+        if (!$data) {
+            return '';
+        }
 
-        // 优先 pro + city
         $parts = [];
-        if (!empty($data['pro']))  $parts[] = $data['pro'];
+        if (!empty($data['pro'])) {
+            $parts[] = $data['pro'];
+        }
         if (!empty($data['city']) && $data['city'] !== $data['pro']) {
             $parts[] = $data['city'];
         }
 
-        // 后备：addr 去掉运营商后缀
         if (empty($parts) && !empty($data['addr'])) {
             $addr = trim($data['addr']);
             if ($addr && !in_array($addr, ['局域网', '本机地址', '保留地址'])) {
@@ -283,9 +618,6 @@ class Plugin implements PluginInterface
         return $parts ? implode(' ', $parts) : '';
     }
 
-    /**
-     * 调用 ipshudi 在线查询 IP 位置（HTML 页面抓取）
-     */
     private static function queryIpShudi($ip)
     {
         $url = 'https://www.ipshudi.com/' . urlencode($ip) . '.htm';
@@ -296,7 +628,9 @@ class Plugin implements PluginInterface
             ],
         ]);
         $html = @file_get_contents($url, false, $ctx);
-        if (!$html) return '';
+        if (!$html) {
+            return '';
+        }
 
         $location = '';
         if (preg_match('#<td class="th">归属地</td>\s*<td>\s*<span>([^<]+)</span>#i', $html, $m)) {
@@ -311,34 +645,6 @@ class Plugin implements PluginInterface
         return $location;
     }
 
-    /**
-     * 读取用户选择的 IP API 提供商
-     */
-    private static function getApiProvider()
-    {
-        static $provider = null;
-        if ($provider === null) {
-            try {
-                $config = Options::alloc()->plugin('CommentAvatar');
-                $config = $config ? $config->toArray() : [];
-            } catch (\Exception $e) {
-                $config = [];
-            }
-            $val = $config['apiProvider'] ?? 'ip-api';
-            // 兼容 Typecho 可能将 Radio 值存为数组的情况
-            if (is_array($val)) $val = implode('', $val);
-            $provider = in_array($val, ['ip-api', 'pconline', 'ipshudi'], true) ? $val : 'ip-api';
-        }
-        return $provider;
-    }
-
-    /**
-     * 将完整地理位置精简为短格式（用于评论旁标签）
-     *
-     * "中国 广东 深圳 电信" → "广东 · 深圳"
-     * "中国 北京 北京"       → "北京"
-     * "美国 加利福尼亚 洛杉矶" → "美国 · 洛杉矶"
-     */
     public static function formatLocationShort($location)
     {
         $parts = explode(' ', trim($location));
@@ -347,14 +653,14 @@ class Plugin implements PluginInterface
         }));
 
         $count = count($parts);
-        if ($count === 0) return '';
+        if ($count === 0) {
+            return '';
+        }
 
         if ($count <= 2) {
             return implode(' · ', $parts);
         }
 
-        // 3+ 段：跳过第一段（国家，如"中国"），取省+市
-        // 国外则保留国家+城市
         $lastIsIsp = in_array(end($parts), ['电信', '联通', '移动', '铁通', '教育网', '鹏博士', '长城宽带']);
         $meaningful = $lastIsIsp ? array_slice($parts, 0, -1) : $parts;
 
@@ -370,7 +676,6 @@ class Plugin implements PluginInterface
             return $meaningful[0];
         }
 
-        // 去重：省市区名相同时只保留一个
         if (count($meaningful) >= 2 && $meaningful[0] === $meaningful[1]) {
             array_shift($meaningful);
         }
@@ -389,16 +694,31 @@ class Plugin implements PluginInterface
         return __DIR__ . '/cache/ip_locations.json';
     }
 
-    // =========================================================================
-    //  配置读取
-    // =========================================================================
+    private static function getApiProvider()
+    {
+        static $provider = null;
+        if ($provider === null) {
+            try {
+                $config = Options::alloc()->plugin('BetterComment');
+                $config = $config ? $config->toArray() : [];
+            } catch (\Exception $e) {
+                $config = [];
+            }
+            $val = $config['apiProvider'] ?? 'ip-api';
+            if (is_array($val)) {
+                $val = implode('', $val);
+            }
+            $provider = in_array($val, ['ip-api', 'pconline', 'ipshudi'], true) ? $val : 'ip-api';
+        }
+        return $provider;
+    }
 
     private static function isLocationEnabled()
     {
         static $enabled = null;
         if ($enabled === null) {
             try {
-                $config = Options::alloc()->plugin('CommentAvatar');
+                $config = Options::alloc()->plugin('BetterComment');
                 $config = $config ? $config->toArray() : [];
             } catch (\Exception $e) {
                 $config = [];
@@ -406,5 +726,421 @@ class Plugin implements PluginInterface
             $enabled = in_array('enable', $config['showLocation'] ?? ['enable'], true);
         }
         return $enabled;
+    }
+
+    // =========================================================================
+    //  邮件通知
+    // =========================================================================
+
+    /**
+     * 评论提交后的通知钩子
+     */
+    public static function doComment($comment)
+    {
+        self::sendMail($comment->coid);
+    }
+
+    /**
+     * 评论审核状态变化钩子（仅审核通过时发送通知）
+     */
+    public static function doApproved($comment, $edit, $status)
+    {
+        if ('approved' === $status) {
+            self::sendMail(
+                is_object($comment) ? $comment->coid : ($comment['coid'] ?? 0),
+                true
+            );
+        }
+    }
+
+    /**
+     * 发送邮件通知
+     *
+     * @param int  $commentId  评论编号
+     * @param bool $isApproved 是否为审核通过通知
+     * @return bool
+     */
+    public static function sendMail($commentId, $isApproved = false)
+    {
+        if (!$commentId) {
+            return false;
+        }
+
+        // 直接查 DB 获取评论数据（数组），绕过 Widget 初始化复杂性
+        $comment = self::fetchRow('comments', 'coid', $commentId);
+        if (!$comment) {
+            return false;
+        }
+
+        $options = \Helper::options();
+        $plugin  = $options->plugin('BetterComment');
+
+        // 获取关联文章标题，构建永久链接
+        $post  = self::fetchRow('contents', 'cid', $comment['cid']);
+        $title = $post['title'] ?? '';
+        $permalink = trim($options->siteUrl) . '/archive/' . ($post['slug'] ?? $comment['cid']) . '/';
+
+        // 确定收件人
+        $address       = $comment['mail'];
+        $parentComment = null;
+
+        // 如果评论者不是文章作者 → 通知作者
+        if (($comment['authorId'] ?? 0) != ($comment['ownerId'] ?? 0)) {
+            $author = self::fetchRow('users', 'uid', $comment['ownerId']);
+            if ($author && !empty($author['mail'])) {
+                $address = $author['mail'];
+            }
+        }
+
+        // 如果是回复 → 通知被回复者
+        if (0 < ($comment['parent'] ?? 0)) {
+            $parentComment = self::fetchRow('comments', 'coid', $comment['parent']);
+            if ($parentComment && $comment['mail'] != $parentComment['mail']) {
+                $address = $parentComment['mail'];
+            }
+        }
+
+        $data = [
+            'fromName' => (!empty($plugin->public_name)) ? $plugin->public_name : trim($options->title),
+            'from'     => $plugin->public_mail,
+            'to'       => $address,
+            'replyTo'  => $plugin->public_replyto,
+        ];
+
+        if ($isApproved) {
+            $data['subject'] = $options->title . '：您的评论已通过审核';
+            $html = @file_get_contents(__DIR__ . '/theme/approved.html');
+            if (!$html) return false;
+            $data['html'] = str_replace(
+                ['{blogUrl}', '{blogName}', '{author}', '{permalink}', '{title}', '{text}'],
+                [
+                    trim($options->siteUrl), trim($options->title),
+                    trim($comment['author'] ?? ''), trim($permalink),
+                    trim($title), trim($comment['text'] ?? ''),
+                ],
+                $html
+            );
+        } elseif (!is_null($parentComment)) {
+            $data['subject'] = $options->title . '：您的评论有了新的回复';
+            $html = @file_get_contents(__DIR__ . '/theme/reply.html');
+            if (!$html) return false;
+            $data['html'] = str_replace(
+                ['{blogUrl}', '{blogName}', '{author}', '{permalink}', '{title}', '{text}',
+                 '{replyAuthor}', '{replyText}', '{commentUrl}'],
+                [
+                    trim($options->siteUrl), trim($options->title),
+                    trim($parentComment['author'] ?? ''), trim($permalink),
+                    trim($title), trim($parentComment['text'] ?? ''),
+                    trim($comment['author'] ?? ''), trim($comment['text'] ?? ''),
+                    trim($permalink),
+                ],
+                $html
+            );
+        } else {
+            $data['subject'] = $options->title . '：文章有了新评论';
+            $html = @file_get_contents(__DIR__ . '/theme/author.html');
+            if (!$html) return false;
+            $data['html'] = str_replace(
+                ['{blogUrl}', '{blogName}', '{author}', '{permalink}', '{title}', '{text}'],
+                [
+                    trim($options->siteUrl), trim($options->title),
+                    trim($comment['author'] ?? ''), trim($permalink),
+                    trim($title), trim($comment['text'] ?? ''),
+                ],
+                $html
+            );
+        }
+
+        // 根据接口发送
+        switch ($plugin->public_interface) {
+            case 'sendcloud':
+                $data['apiUser'] = $plugin->sendcloud_api_user;
+                $data['apiKey']  = $plugin->sendcloud_api_key;
+                return self::sendCloud($data);
+
+            case 'aliyun':
+                $regionMap = [
+                    'hangzhou'  => ['api' => 'https://dm.aliyuncs.com/',                            'version' => '2015-11-23', 'region' => 'cn-hangzhou'],
+                    'singapore' => ['api' => 'https://dm.ap-southeast-1.aliyuncs.com/',              'version' => '2017-06-22', 'region' => 'ap-southeast-1'],
+                    'sydney'    => ['api' => 'https://dm.ap-southeast-2.aliyuncs.com/',              'version' => '2017-06-22', 'region' => 'ap-southeast-2'],
+                ];
+                $region = $regionMap[$plugin->ali_region] ?? $regionMap['hangzhou'];
+                $data['api']         = $region['api'];
+                $data['version']     = $region['version'];
+                $data['region']      = $region['region'];
+                $data['accessid']    = $plugin->ali_accesskey_id;
+                $data['accesssecret'] = $plugin->ali_accesskey_secret;
+                return self::aliyun($data);
+
+            default: // SMTP
+                $data['smtp_host']   = $plugin->smtp_host;
+                $data['smtp_port']   = $plugin->smtp_port;
+                $data['smtp_user']   = $plugin->smtp_user;
+                $data['smtp_pass']   = $plugin->smtp_pass;
+                $data['smtp_auth']   = $plugin->smtp_auth;
+                $data['smtp_secure'] = $plugin->smtp_secure;
+                return self::smtp($data);
+        }
+    }
+
+    // =========================================================================
+    //  SendCloud 邮件发送
+    // =========================================================================
+
+    public static function sendCloud($data)
+    {
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, 'http://api.sendcloud.net/apiv2/mail/send');
+        curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'POST');
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
+        $result = curl_exec($ch);
+        $errno  = curl_errno($ch);
+        $error  = curl_error($ch);
+        curl_close($ch);
+
+        $flag = true;
+        $plugin = \Helper::options()->plugin('BetterComment');
+
+        if (in_array('enable', $plugin->public_debug)) {
+            $log = '[Send Cloud] ' . date('Y-m-d H:i:s') . ':' . PHP_EOL;
+            if ($errno) {
+                $flag = false;
+                $log .= _t('邮件发送失败, 错误代码：' . $errno . '，错误提示: ' . $error . PHP_EOL);
+            }
+            $json = json_decode($result);
+            if ($json && 200 != $json->statusCode) {
+                $flag = false;
+                $log .= _t('邮件发送失败，错误提示：' . $json->message . PHP_EOL);
+            }
+            $log .= _t('返回数据：' . serialize($result) . PHP_EOL);
+            $log .= '-------------------------------------------' . PHP_EOL . PHP_EOL;
+            @file_put_contents(__DIR__ . '/debug.txt', $log, FILE_APPEND);
+        }
+
+        return $flag;
+    }
+
+    // =========================================================================
+    //  阿里云邮件发送
+    // =========================================================================
+
+    public static function aliyun($param)
+    {
+        $data = [
+            'Action'          => 'SingleSendMail',
+            'AccountName'     => $param['from'],
+            'ReplyToAddress'  => 'true',
+            'AddressType'     => 1,
+            'ToAddress'       => $param['to'],
+            'FromAlias'       => $param['fromName'],
+            'Subject'         => $param['subject'],
+            'HtmlBody'        => $param['html'],
+            'Format'          => 'JSON',
+            'Version'         => $param['version'],
+            'AccessKeyId'     => $param['accessid'],
+            'SignatureMethod' => 'HMAC-SHA1',
+            'Timestamp'       => gmdate('Y-m-d\TH:i:s\Z'),
+            'SignatureVersion' => '1.0',
+            'SignatureNonce'  => md5(time() . uniqid()),
+            'RegionId'        => $param['region'],
+        ];
+        $data['Signature'] = self::sign($data, $param['accesssecret']);
+
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'POST');
+        curl_setopt($ch, CURLOPT_URL, $param['api']);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, self::getPostHttpBody($data));
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        $result  = curl_exec($ch);
+        $errno   = curl_errno($ch);
+        $error   = curl_error($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        $flag = true;
+        $plugin = \Helper::options()->plugin('BetterComment');
+
+        if (in_array('enable', $plugin->public_debug)) {
+            $log = '[Aliyun] ' . date('Y-m-d H:i:s') . ':' . PHP_EOL;
+            if ($errno) {
+                $flag = false;
+                $log .= _t('邮件发送失败, 错误代码：' . $errno . '，错误提示: ' . $error . PHP_EOL);
+            }
+            if (400 <= $httpCode) {
+                $flag = false;
+                $json = json_decode($result);
+                if ($json) {
+                    $log .= _t('错误代码：' . $json->Code . '，错误提示：' . $json->Message . PHP_EOL);
+                } else {
+                    $log .= _t('HTTP Code：' . $httpCode . PHP_EOL);
+                }
+            }
+            $log .= _t('返回数据：' . serialize($result) . PHP_EOL);
+            $log .= '-------------------------------------------' . PHP_EOL . PHP_EOL;
+            @file_put_contents(__DIR__ . '/debug.txt', $log, FILE_APPEND);
+        }
+
+        return $flag;
+    }
+
+    // =========================================================================
+    //  SMTP 邮件发送
+    // =========================================================================
+
+    public static function smtp($param)
+    {
+        if (!class_exists('PHPMailer\PHPMailer\PHPMailer')) {
+            require __DIR__ . '/lib/PHPMailer.php';
+        }
+        if (!class_exists('PHPMailer\PHPMailer\SMTP')) {
+            require __DIR__ . '/lib/SMTP.php';
+        }
+        if (!class_exists('PHPMailer\PHPMailer\Exception')) {
+            require __DIR__ . '/lib/Exception.php';
+        }
+
+        $mail = new \PHPMailer\PHPMailer\PHPMailer(false);
+        $mail->CharSet = 'UTF-8';
+        $mail->isSMTP();
+        $mail->Host     = $param['smtp_host'];
+        $mail->Port     = $param['smtp_port'] ?: 25;
+        $mail->Username = $param['smtp_user'];
+        $mail->Password = $param['smtp_pass'];
+
+        if (in_array('enable', $param['smtp_auth'])) {
+            $mail->SMTPAuth = true;
+        }
+        if ('none' != $param['smtp_secure']) {
+            $mail->SMTPSecure = $param['smtp_secure'];
+        }
+
+        $mail->setFrom($param['from'], $param['fromName']);
+        $mail->addReplyTo($param['replyTo'], $param['fromName']);
+        $mail->addAddress($param['to']);
+        $mail->isHTML(true);
+
+        // Debug 级别：仅 Debug 模式开启时输出
+        $plugin = \Helper::options()->plugin('BetterComment');
+        $mail->SMTPDebug = in_array('enable', $plugin->public_debug) ? 2 : 0;
+
+        $mail->Subject  = $param['subject'];
+        $mail->msgHTML($param['html']);
+
+        $result = $mail->send();
+
+        if (in_array('enable', $plugin->public_debug)) {
+            $log  = '[SMTP] ' . date('Y-m-d H:i:s') . ':' . PHP_EOL;
+            $log .= 'data: ' . serialize($param) . PHP_EOL . PHP_EOL;
+            $log .= _t('返回：' . var_export($result, true) . '; 错误: ' . $mail->ErrorInfo . PHP_EOL);
+            $log .= '-------------------------------------------' . PHP_EOL . PHP_EOL;
+            @file_put_contents(__DIR__ . '/debug.txt', $log, FILE_APPEND);
+        }
+
+        return $result;
+    }
+
+    // =========================================================================
+    //  找回密码 — 登录页链接
+    // =========================================================================
+
+    /**
+     * 在登录页底部添加"忘记密码"链接
+     */
+    public static function forgetLink()
+    {
+        $options = \Helper::options();
+        $plugin  = $options->plugin('BetterComment');
+
+        if (!in_array('enable', $plugin->public_forget)) {
+            return;
+        }
+
+        $request   = \Typecho\Request::getInstance();
+        $pathinfo  = $request->getRequestUrl();
+
+        if (preg_match('/\/login\.php/i', $pathinfo)) {
+            $url = \Typecho\Common::url(
+                '/action/commentavatar?forget',
+                $options->index
+            );
+            ?>
+            <script>
+                var forget = document.createElement('a');
+                forget.href = '<?php echo $url; ?>';
+                var text = document.createTextNode('<?php _e('忘记密码');?>');
+                forget.appendChild(text);
+                document.getElementsByClassName('more-link')[0].appendChild(forget);
+            </script>
+            <?php
+        }
+    }
+
+    // =========================================================================
+    //  工具方法
+    // =========================================================================
+
+    /**
+     * 获取 Widget 对象
+     *
+     * @param string $table 数据表名（Comments / Users / Contents）
+     * @param string $key   查询字段
+     * @param mixed  $val   查询值
+     * @return mixed
+     */
+    /**
+     * 直接查 DB 获取单行数据（绕过 Widget 复杂初始化）
+     */
+    private static function fetchRow(string $table, string $key, $val): ?array
+    {
+        try {
+            $db = \Typecho\Db::get();
+            return $db->fetchRow(
+                $db->select()->from('table.' . $table)
+                    ->where($key . ' = ?', $val)->limit(1)
+            ) ?: null;
+        } catch (\Exception $e) {
+            return null;
+        }
+    }
+
+    // =========================================================================
+    //  阿里云签名
+    // =========================================================================
+
+    private static function sign($param, $accesssecret)
+    {
+        ksort($param);
+        $stringToSign = 'POST&' . self::percentEncode('/') . '&';
+        $tmp = '';
+        foreach ($param as $k => $v) {
+            $tmp .= '&' . self::percentEncode($k) . '=' . self::percentEncode($v);
+        }
+        $tmp = trim($tmp, '&');
+        $stringToSign .= self::percentEncode($tmp);
+        return base64_encode(
+            hash_hmac('sha1', $stringToSign, $accesssecret . '&', true)
+        );
+    }
+
+    private static function percentEncode($val)
+    {
+        $res = urlencode($val);
+        $res = str_replace('+', '%20', $res);
+        $res = str_replace('*', '%2A', $res);
+        $res = str_replace('%7E', '~', $res);
+        return $res;
+    }
+
+    private static function getPostHttpBody($param)
+    {
+        $str = '';
+        foreach ($param as $k => $v) {
+            $str .= $k . '=' . urlencode($v) . '&';
+        }
+        return substr($str, 0, -1);
     }
 }
