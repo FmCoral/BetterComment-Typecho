@@ -2,15 +2,9 @@
 /**
  * BetterComment — 全能评论增强插件（头像 / IP 属地 / 邮件通知 / 找回密码）
  *
- *
- * - 头像：QQ 邮箱自动用 QQ 头像，其他邮箱随机匹配预设头像
- * - IP 属地：评论旁显示 IP 地理位置（ip-api.com / pconline 双 API）
- * - 邮件通知：评论时通知文章作者、被回复者；审核通过通知评论者
- * - 找回密码：登录页"忘记密码"链接，邮件重置密码
- *
  * @package BetterComment
  * @author  FmCoral
- * @version 1.0.0
+ * @version 1.1.0
  * @link    https://github.com/FmCoral/BetterComment-Typecho
  */
 
@@ -92,18 +86,12 @@ class Plugin implements PluginInterface
         );
         $form->addInput($showLocation);
 
-        $apiProvider = new Radio(
-            'apiProvider',
-            [
-                'ip-api'   => _t('ip-api.com（国际，中英文）'),
-                'pconline' => _t('太平洋 pconline（国内，JSON）'),
-                'ipshudi'  => _t('ipshudi（国内，HTML 抓取）'),
-            ],
-            'ip-api',
-            _t('IP 查询服务'),
-            _t('三个免费 API 可选，国内推荐太平洋或 ipshudi。')
+        $uapisAuth = new Text(
+            'uapis_auth', null, null,
+            _t('uapis.cn IP 接口 Key（Authorization）'),
+            _t('在 uapis.cn 申请 Key 后填入（含鉴权前缀，如 Bearer xxxx）。IP 属地统一走 https://uapis.cn/api/v1/network/ipinfo（参数 ip + source=commercial，返回 region + isp）；未填 Key 或查询失败时回退 ip-api.com 免费接口。')
         );
-        $form->addInput($apiProvider);
+        $form->addInput($uapisAuth);
 
         // =====================================================================
         //  2. 邮件发送 — 公共配置
@@ -111,6 +99,19 @@ class Plugin implements PluginInterface
         $section2 = new Layout('div', ['class' => 'typecho-page-title']);
         $section2->html('<h2>📧 邮件通知设置</h2>');
         $form->addItem($section2);
+
+        $enableMail = new Checkbox(
+            'enable_mail',
+            ['enable' => _t('启用邮件通知')],
+            ['enable'],
+            _t('邮件通知'),
+            _t('关闭后不再发送任何邮件通知（新评论 / 回复 / 审核通过），需要时重新勾选即可。')
+        );
+        $form->addInput($enableMail);
+
+        // 条件必填：仅当本次提交勾选了「启用邮件通知」时，发信接口/发件邮箱/回信邮箱才必填；
+        // 未勾选启用或渲染设置页（GET）时均不校验，留空可正常保存
+        $mailOn = !empty($_POST['enable_mail']) && in_array('enable', (array) $_POST['enable_mail'], true);
 
         $public_interface = new Radio(
             'public_interface',
@@ -122,7 +123,9 @@ class Plugin implements PluginInterface
             null,
             _t('发信接口')
         );
-        $form->addInput($public_interface->addRule('required', _t('请选择发件接口')));
+        $form->addInput($mailOn
+            ? $public_interface->addRule('required', _t('请选择发件接口'))
+            : $public_interface);
 
         $public_name = new Text(
             'public_name', null, null,
@@ -136,14 +139,18 @@ class Plugin implements PluginInterface
             _t('发件邮箱地址'),
             _t('邮件中显示的发信地址')
         );
-        $form->addInput($public_mail->addRule('required', _t('请输入发件邮箱地址'))->addRule('email', _t('请输入正确的邮箱地址')));
+        $form->addInput($mailOn
+            ? $public_mail->addRule('required', _t('请输入发件邮箱地址'))->addRule('email', _t('请输入正确的邮箱地址'))
+            : $public_mail->addRule('email', _t('请输入正确的邮箱地址')));
 
         $public_replyto = new Text(
             'public_replyto', null, null,
             _t('邮件回复地址'),
             _t('附带在邮件中的默认回信地址')
         );
-        $form->addInput($public_replyto->addRule('required', _t('请输入回信邮箱地址'))->addRule('email', _t('请输入正确的邮箱地址')));
+        $form->addInput($mailOn
+            ? $public_replyto->addRule('required', _t('请输入回信邮箱地址'))->addRule('email', _t('请输入正确的邮箱地址'))
+            : $public_replyto->addRule('email', _t('请输入正确的邮箱地址')));
 
         $public_debug = new Checkbox(
             'public_debug',
@@ -420,23 +427,8 @@ EOS);
            . 'alt="' . htmlspecialchars($author) . '" '
            . 'width="' . (int) $size . '" height="' . (int) $size . '" />';
 
-        // --- IP 属地标签 ---
-        if (self::isLocationEnabled()) {
-            $ip = $comment->ip ?? '';
-            if ($ip && $ip !== 'unknown') {
-                $location = self::getIpLocation($ip);
-                if ($location && $location !== '未知' && $location !== '本地网络') {
-                    $short = self::formatLocationShort($location);
-                    if ($short) {
-                        echo '<span class="cm-ip-loc" style="display:inline-block;margin-left:3px;'
-                           . 'padding:0 5px;border-radius:2px;background:#f2f3f5;color:#999;'
-                           . 'font-size:.65rem;line-height:1.6;vertical-align:middle;'
-                           . 'max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'
-                           . htmlspecialchars($short) . '</span>';
-                    }
-                }
-            }
-        }
+        // 地理位置不再由头像钩子输出（会与 VOID 主题评论区布局重叠），
+        // 统一由 VOID 主题渲染在「时间 | 位置 | 点赞」行，显示开关见 isLocationEnabled()。
     }
 
     /**
@@ -500,9 +492,10 @@ EOS);
     // =========================================================================
 
     /**
-     * 获取 IP 地理位置
+     * 获取 IP 地理位置（完全独立）
      *
-     * 优先复用 IpAccessLog 插件的缓存，未安装时使用内置查询。
+     * 统一走 uapis.cn 自定义接口（Authorization Key + ip + source=commercial）；
+     * 未配置 Key 或 uapis 查询失败时，回退 ip-api.com 免费接口兜底。
      */
     public static function getIpLocation($ip)
     {
@@ -513,50 +506,110 @@ EOS);
             return '本地网络';
         }
 
-        // 复用 IpAccessLog 插件缓存（如果已安装）
-        if (class_exists('\TypechoPlugin\IpAccessLog\Plugin')) {
-            return \TypechoPlugin\IpAccessLog\Plugin::getIpLocation($ip);
-        }
-
-        // 内置查询：读缓存 → API → 写缓存
+        // 读缓存：加共享锁，避免并发写入截断时读到半截内容导致缓存被重置覆盖
         $cacheFile = self::getIpCacheFile();
-        $cache = [];
-        if (file_exists($cacheFile)) {
-            $cache = json_decode(file_get_contents($cacheFile), true) ?: [];
-        }
+        $cache = self::readIpCache($cacheFile);
         if (isset($cache[$ip])) {
             return $cache[$ip];
         }
 
-        $location = '未知';
-        try {
-            $provider = self::getApiProvider();
-            if ($provider === 'pconline') {
-                $result = self::queryPconline($ip);
-            } elseif ($provider === 'ipshudi') {
-                $result = self::queryIpShudi($ip);
-            } else {
+        // 主查：uapis.cn 自定义接口（返回 region + isp 拼接）
+        $location = self::queryUapis($ip);
+
+        // 兜底：未配置 Key 或 uapis 失败时，回退 ip-api.com 免费接口
+        if (empty($location) || $location === '未知') {
+            try {
                 $result = self::queryIpApi($ip);
+                if ($result) {
+                    $location = $result;
+                }
+            } catch (\Exception $e) {
+                // 静默失败
             }
-            if ($result) {
-                $location = $result;
-            }
-        } catch (\Exception $e) {
-            // 静默失败
+        }
+        if (empty($location)) {
+            $location = '未知';
         }
 
-        // 写缓存（上限 5000 条）
-        $cache[$ip] = $location;
-        if (count($cache) > 5000) {
-            $cache = array_slice($cache, -4000, 4000, true);
+        // 写缓存（上限 5000 条）：排他锁内重新读最新内容再合并写入，
+        // 读-改-写全程加锁，保证并发请求下不互相覆盖、不丢已有记录
+        self::writeIpCache($cacheFile, $ip, $location);
+
+        return $location;
+    }
+
+    /**
+     * 读取 IP 位置缓存（共享锁）
+     *
+     * 加共享锁防止并发写入过程中（文件被截断）读到半截 JSON，
+     * 解析失败返回空数组（此时调用方会重新查询，但不会再覆盖写坏缓存）。
+     *
+     * @access private
+     * @param string $cacheFile
+     * @return array
+     */
+    private static function readIpCache($cacheFile)
+    {
+        $cache = [];
+        if (!file_exists($cacheFile)) {
+            return $cache;
         }
+        $fp = @fopen($cacheFile, 'r');
+        if ($fp) {
+            if (flock($fp, LOCK_SH)) {
+                $data = stream_get_contents($fp);
+                flock($fp, LOCK_UN);
+                if ($data !== false && $data !== '') {
+                    $cache = json_decode($data, true);
+                    if (!is_array($cache)) {
+                        $cache = [];
+                    }
+                }
+            }
+            fclose($fp);
+        }
+        return $cache;
+    }
+
+    /**
+     * 写入 IP 位置缓存（排他锁内重新读最新内容合并）
+     *
+     * 在排他锁内重新读取文件最新内容再合并本次结果，避免多个并发请求
+     * 基于各自旧快照写入导致互相覆盖（后写者把先写者新增的记录冲掉）。
+     * 锁内截断重写，保证读取端在同一把锁下拿到的始终是完整 JSON。
+     *
+     * @access private
+     * @param string $cacheFile
+     * @param string $ip
+     * @param string $location
+     * @return void
+     */
+    private static function writeIpCache($cacheFile, $ip, $location)
+    {
         $dir = dirname($cacheFile);
         if (!is_dir($dir)) {
             @mkdir($dir, 0755, true);
         }
-        @file_put_contents($cacheFile, json_encode($cache, JSON_UNESCAPED_UNICODE), LOCK_EX);
-
-        return $location;
+        $fp = @fopen($cacheFile, 'c+');
+        if (!$fp) {
+            return;
+        }
+        if (flock($fp, LOCK_EX)) {
+            // 锁内重新读取最新内容，以它为准合并，避免覆盖并发请求刚写入的记录
+            $cache = json_decode(stream_get_contents($fp), true);
+            $cache = is_array($cache) ? $cache : [];
+            $cache[$ip] = $location;
+            if (count($cache) > 5000) {
+                $cache = array_slice($cache, -4000, 4000, true);
+            }
+            $content = json_encode($cache, JSON_UNESCAPED_UNICODE);
+            ftruncate($fp, 0);
+            rewind($fp);
+            fwrite($fp, $content);
+            fflush($fp);
+            flock($fp, LOCK_UN);
+        }
+        fclose($fp);
     }
 
     private static function queryIpApi($ip)
@@ -583,69 +636,102 @@ EOS);
         return implode(' ', $parts);
     }
 
-    private static function queryPconline($ip)
+    /**
+     * 调用 uapis.cn 自定义 IP 接口
+     *
+     * 统一走用户配置的接口：https://uapis.cn/api/v1/network/ipinfo
+     * 参数 ip + source=commercial，Authorization 头为后台配置的 Key（含鉴权前缀）。
+     * 返回 region（国家+省+市）并拼接 isp 运营商。
+     * 未配置 Key 或查询失败返回 null，由调用方回退 ip-api.com。
+     *
+     * @access private
+     * @param string $ip
+     * @return string|null
+     */
+    private static function queryUapis($ip)
     {
-        $url = 'https://whois.pconline.com.cn/ipJson.jsp?ip=' . urlencode($ip) . '&json=true';
-        $ctx = stream_context_create(['http' => ['timeout' => 2]]);
-        $json = @file_get_contents($url, false, $ctx);
-        if (!$json) {
-            return '';
+        $auth = self::getUapisAuth();
+        if ($auth === '') {
+            return null; // 未配置 Key，走兜底
         }
 
-        $json = mb_convert_encoding($json, 'UTF-8', 'GBK');
-        $data = json_decode($json, true);
-        if (!$data) {
-            return '';
-        }
-
-        $parts = [];
-        if (!empty($data['pro'])) {
-            $parts[] = $data['pro'];
-        }
-        if (!empty($data['city']) && $data['city'] !== $data['pro']) {
-            $parts[] = $data['city'];
-        }
-
-        if (empty($parts) && !empty($data['addr'])) {
-            $addr = trim($data['addr']);
-            if ($addr && !in_array($addr, ['局域网', '本机地址', '保留地址'])) {
-                $addrClean = preg_replace('/\s+\S+$/', '', $addr);
-                $parts[] = $addrClean ?: $addr;
-            }
-        }
-
-        return $parts ? implode(' ', $parts) : '';
-    }
-
-    private static function queryIpShudi($ip)
-    {
-        $url = 'https://www.ipshudi.com/' . urlencode($ip) . '.htm';
+        $url = 'https://uapis.cn/api/v1/network/ipinfo?ip=' . urlencode($ip) . '&source=commercial';
         $ctx = stream_context_create([
             'http' => [
                 'timeout' => 5,
-                'header'  => "User-Agent: Mozilla/5.0\r\n",
+                'method'  => 'GET',
+                'header'  => 'Authorization: ' . $auth . "\r\n",
             ],
         ]);
-        $html = @file_get_contents($url, false, $ctx);
-        if (!$html) {
-            return '';
+        $json = @file_get_contents($url, false, $ctx);
+        if (!$json) {
+            return null;
         }
 
-        $location = '';
-        if (preg_match('#<td class="th">归属地</td>\s*<td>\s*<span>([^<]+)</span>#i', $html, $m)) {
-            $location = trim($m[1]);
+        $data = @json_decode($json, true);
+        if (!is_array($data)) {
+            return null;
         }
-        if (preg_match('#<td class="th">运营商</td>\s*<td>\s*<span>([^<]+)</span>#i', $html, $m)) {
-            $isp = trim($m[1]);
-            if ($isp !== '' && !in_array($isp, ['-', '未知'])) {
-                $location .= ' ' . $isp;
+
+        $region = trim((string)($data['region'] ?? ''));
+        $isp    = trim((string)($data['isp'] ?? ''));
+        $useless = ['*', '-', 'unknown', '未知', 'n/a', 'null', 'na'];
+
+        if ($region === '' || in_array(mb_strtolower($region), $useless, true)) {
+            // region 无效时用 isp 兜底
+            if ($isp !== '' && !in_array(mb_strtolower($isp), $useless, true)) {
+                return $isp;
             }
+            return null;
         }
-        return $location;
+
+        // region 有效：拼接运营商（isp 与 region 不重复时）。
+        // 不再加方括号——缓存里存干净数据，显示层 formatLocationShort() 已统一格式化
+        if ($isp !== '' && !in_array(mb_strtolower($isp), $useless, true)
+            && mb_stripos($region, $isp) === false) {
+            return $region . ' ' . $isp;
+        }
+
+        return $region;
+    }
+
+    /**
+     * 读取 uapis.cn 接口鉴权 Key（Authorization 头完整值）
+     *
+     * @access private
+     * @return string
+     */
+    private static function getUapisAuth()
+    {
+        static $auth = null;
+        if ($auth === null) {
+            try {
+                $config = Options::alloc()->plugin('BetterComment');
+                $config = $config ? $config->toArray() : [];
+            } catch (\Exception $e) {
+                $config = [];
+            }
+            $auth = trim((string)($config['uapis_auth'] ?? ''));
+        }
+        return $auth;
     }
 
     public static function formatLocationShort($location)
     {
+        // 运营商标准化：中国移动 / China Mobile 等 → 四大运营商简写「移动 / 联通 / 电信 / 铁通 / 广电」
+        // 注意顺序：英文全称必须先于简称替换，避免残留「Communications Corporation」
+        $location = str_ireplace(
+            ['中国移动', 'China Mobile Communications Corporation', 'China Mobile Communications', 'China Mobile',
+             '中国联通', 'China Unicom', '中国电信', 'China Telecom', '中国铁通', 'China TieTong',
+             '中国广电', 'China Broadcasting', '中国教育网', 'CERNET', '长城宽带', 'Great Wall Broadband'],
+            ['移动', '移动', '移动', '移动', '联通', '联通', '电信', '电信', '铁通', '铁通',
+             '广电', '广电', '教育网', '教育网', '长城宽带', '长城宽带'],
+            $location
+        );
+
+        // 去掉 uapis 拼接 isp 时加的方括号：'[移动]' → '移动'
+        $location = str_replace(['[', ']'], '', $location);
+
         $parts = explode(' ', trim($location));
         $parts = array_values(array_filter($parts, function ($v) {
             return $v !== '' && $v !== '未知';
@@ -660,26 +746,20 @@ EOS);
             return implode(' · ', $parts);
         }
 
-        $lastIsIsp = in_array(end($parts), ['电信', '联通', '移动', '铁通', '教育网', '鹏博士', '长城宽带']);
-        $meaningful = $lastIsIsp ? array_slice($parts, 0, -1) : $parts;
-
-        if (count($meaningful) <= 1) {
-            return $meaningful[0];
+        // 去「中国」国家前缀
+        if ($parts[0] === '中国') {
+            array_shift($parts);
         }
 
-        if ($meaningful[0] === '中国') {
-            array_shift($meaningful);
+        if (count($parts) === 1) {
+            return $parts[0];
         }
 
-        if (count($meaningful) === 1) {
-            return $meaningful[0];
+        if (count($parts) >= 2 && $parts[0] === $parts[1]) {
+            array_shift($parts);
         }
 
-        if (count($meaningful) >= 2 && $meaningful[0] === $meaningful[1]) {
-            array_shift($meaningful);
-        }
-
-        return implode(' · ', $meaningful);
+        return implode(' · ', $parts);
     }
 
     private static function isPrivateIp($ip)
@@ -693,26 +773,7 @@ EOS);
         return __DIR__ . '/cache/ip_locations.json';
     }
 
-    private static function getApiProvider()
-    {
-        static $provider = null;
-        if ($provider === null) {
-            try {
-                $config = Options::alloc()->plugin('BetterComment');
-                $config = $config ? $config->toArray() : [];
-            } catch (\Exception $e) {
-                $config = [];
-            }
-            $val = $config['apiProvider'] ?? 'ip-api';
-            if (is_array($val)) {
-                $val = implode('', $val);
-            }
-            $provider = in_array($val, ['ip-api', 'pconline', 'ipshudi'], true) ? $val : 'ip-api';
-        }
-        return $provider;
-    }
-
-    private static function isLocationEnabled()
+    public static function isLocationEnabled()
     {
         static $enabled = null;
         if ($enabled === null) {
@@ -773,6 +834,11 @@ EOS);
 
         $options = \Helper::options();
         $plugin  = $options->plugin('BetterComment');
+
+        // 邮件通知总开关：后台未勾选「启用邮件通知」时直接跳过发送
+        if (!in_array('enable', $plugin->enable_mail ?? ['enable'])) {
+            return false;
+        }
 
         // 获取关联文章，用 Typecho 实际路由生成正确链接
         $post  = self::fetchRow('contents', 'cid', $comment['cid']);
