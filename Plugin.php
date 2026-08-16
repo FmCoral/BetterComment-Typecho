@@ -41,6 +41,9 @@ class Plugin implements PluginInterface
         // === 头像 / IP 属地钩子 ===
         \Typecho\Plugin::factory('Widget\Base\Comments')->gravatar = [__CLASS__, 'renderAvatar'];
 
+        // === 浏览器精确定位：前台页脚注入定位脚本 ===
+        \Typecho\Plugin::factory('Widget\Archive')->footer = [__CLASS__, 'frontendScript'];
+
         // === 邮件通知钩子 ===
         \Typecho\Plugin::factory('Widget\Feedback')->finishComment = [__CLASS__, 'doComment'];
         \Typecho\Plugin::factory('Widget\Comments\Edit')->finishComment = [__CLASS__, 'doComment'];
@@ -92,6 +95,30 @@ class Plugin implements PluginInterface
             _t('在 uapis.cn 申请 Key 后填入（含鉴权前缀，如 Bearer xxxx）。IP 属地统一走 https://uapis.cn/api/v1/network/ipinfo（参数 ip + source=commercial，返回 region + isp）；未填 Key 或查询失败时回退 ip-api.com 免费接口。')
         );
         $form->addInput($uapisAuth);
+
+        // ---------------------------------------------------------------------
+        //  浏览器精确定位（高德反地理编码）
+        //  前端拿浏览器经纬度，服务端调高德 regeo 解析完整地址，per-comment 存储
+        // ---------------------------------------------------------------------
+        $sectionGeo = new Layout('div', ['class' => 'typecho-page-title']);
+        $sectionGeo->html('<h2>📍 浏览器精确定位（高德）</h2>');
+        $form->addItem($sectionGeo);
+
+        $geoEnable = new Checkbox(
+            'geo_enable',
+            ['enable' => _t('启用浏览器精确定位')],
+            [],
+            _t('浏览器精确定位'),
+            _t('开启后，评论者点击「提交评论」并通过输入校验后，浏览器会请求授权定位；授权成功则用经纬度经高德反地理编码解析出完整地址，随该条评论持久化。评论者拒绝/超时/不支持时静默降级为 IP 属地。仅 HTTPS 生效。')
+        );
+        $form->addInput($geoEnable);
+
+        $amapKey = new Text(
+            'amap_key', null, null,
+            _t('高德 Web 服务 Key'),
+            _t('高德开放平台申请的 Web 服务 Key（https://restapi.amap.com）。仅服务端调用，不会暴露在前端。未填 Key 或未勾选启用时不弹窗、不查询。')
+        );
+        $form->addInput($amapKey);
 
         // =====================================================================
         //  2. 邮件发送 — 公共配置
@@ -789,6 +816,247 @@ EOS);
     }
 
     // =========================================================================
+    //  浏览器精确定位（高德反地理编码，per-comment 存储）
+    // =========================================================================
+
+    /**
+     * 读取插件配置（静态缓存一次）
+     *
+     * @return array
+     */
+    private static function getPluginConfig()
+    {
+        static $config = null;
+        if ($config === null) {
+            try {
+                $plugin = Options::alloc()->plugin('BetterComment');
+                $config = $plugin ? $plugin->toArray() : [];
+            } catch (\Exception $e) {
+                $config = [];
+            }
+        }
+        return $config;
+    }
+
+    /**
+     * 浏览器精确定位是否开启（开关勾选 + 高德 Key 已填）
+     *
+     * @return bool
+     */
+    public static function isGeoEnabled()
+    {
+        $config = self::getPluginConfig();
+        return in_array('enable', $config['geo_enable'] ?? [], true)
+            && trim((string)($config['amap_key'] ?? '')) !== '';
+    }
+
+    /**
+     * 前台页脚钩子：注入浏览器定位脚本（仅精确定位开启时）
+     *
+     * 在 #comment-form 的 submit **捕获阶段**接管（先于 VOID AjaxComment 的
+     * 冒泡监听，无论绑定先后）：复制 AjaxComment 的输入校验（用户要求的
+     * 「输入字段判断」）→ 校验通过后异步请求浏览器定位 → 成功把经纬度塞进
+     * hidden 字段 → requestSubmit() 二次触发（捕获阶段此时放行）→ AjaxComment
+     * 正常 AJAX，serializeArray() 已带上坐标。拒绝/超时/非 HTTPS/不支持定位时
+     * 静默放行，不影响评论提交；resume 一次性 guard 杜绝重复提交。
+     *
+     * @param mixed $archive Widget_Archive
+     * @return void
+     */
+    public static function frontendScript($archive)
+    {
+        if (!self::isGeoEnabled()) {
+            return;
+        }
+        ?>
+<script>
+(function () {
+    var $ = window.jQuery;
+    if (typeof $ === 'undefined' || typeof AjaxComment === 'undefined'
+        || !window.isSecureContext || !('geolocation' in navigator)) { return; }
+
+    function bind() {
+        var form = document.getElementById('comment-form');
+        var btn = document.getElementById('comment-submit-button');
+        if (!form || !btn || form.__bcGeo) { return; }   // PJAX 未替换表单时防重复绑定
+        form.__bcGeo = true;
+
+        // 复用 AjaxComment 的输入校验消息与失败复位，保证提示风格一致
+        function fail(msg) {
+            if (typeof VOID !== 'undefined' && VOID.alert) { VOID.alert(msg); }
+            btn.disabled = false;
+        }
+
+        form.addEventListener('submit', function (e) {
+            if (form.__bcGeoDone) { return; }            // 二次触发：放行给 AjaxComment 正常 AJAX
+            e.preventDefault();
+            e.stopImmediatePropagation();                // 接管：阻止 AjaxComment 同步发 AJAX
+
+            // ---- 复制 VOID 输入字段判断（与 AjaxComment.init 一致）----
+            // 登录用户表单没有 #author/#mail/#url 输入框（走服务端登录资料），
+            // 所有校验必须包裹在「元素存在」判断内，否则 undefined 会被正则误判
+            var $f = $(form);
+            var $mail = $f.find('#mail');
+            if ($f.find('#author')[0] && $f.find('#author').val() === '') { return fail(AjaxComment.noName); }
+            if ($mail[0] && typeof $mail.attr('required') !== 'undefined' && $mail.val() === '') { return fail(AjaxComment.noMail); }
+            if ($mail[0] && $mail.val() !== '') {
+                if (!/^[^@\s<&>]+@([a-z0-9]+\.)+[a-z]{2,4}$/i.test($mail.val())) { return fail(AjaxComment.invalidMail); }
+            }
+            if ($f.find('#url')[0] && $f.find('#url').val() === '' && typeof $f.find('#url').attr('required') !== 'undefined') { return fail(AjaxComment.noUrl); }
+            if (!$f.find('#textarea').val().replace(/(^\s*)|(\s*$)/g, '')) { return fail(AjaxComment.noContent); }
+
+            btn.disabled = true;                         // 定位期间防重复点击
+            var resume = function () {                   // 只放行一次，杜绝超时后又授权成功导致的重复提交
+                if (form.__bcGeoDone) { return; }
+                form.__bcGeoDone = true;
+                btn.disabled = false;
+                if (form.requestSubmit) { form.requestSubmit(); }
+                else { btn.click(); }
+            };
+            navigator.geolocation.getCurrentPosition(function (pos) {
+                if (form.__bcGeoDone) { return; }
+                // 精度过滤：accuracy > 2000m 多为 IP 级粗定位（桌面 Chrome 国内无法用
+                // Google WiFi 定位服务时常见），不可信，丢弃坐标降级走 IP 属地
+                if (!pos.coords || pos.coords.accuracy > 2000) { return resume(); }
+                var h = document.createElement('input');
+                h.type = 'hidden';
+                h.name = 'bc_lnglat';
+                h.value = pos.coords.longitude + ',' + pos.coords.latitude;
+                form.appendChild(h);
+                resume();
+            }, resume, { timeout: 15000, maximumAge: 0, enableHighAccuracy: true });
+        }, true);   // 捕获阶段：先于 AjaxComment 的 submit 冒泡监听
+    }
+
+    bind();                                       // 直开文章页
+    document.addEventListener('pjax:complete', function () { setTimeout(bind, 0); });  // PJAX 进入文章页
+})();
+</script>
+        <?php
+    }
+
+    /**
+     * 高德 Web 服务反地理编码（经纬度 → 完整地址）
+     *
+     * 仅服务端调用，Key 不出现在前端。失败返回空串，由调用方静默处理。
+     *
+     * @param string $lnglat 经度,纬度
+     * @return string
+     */
+    private static function queryAmap($lnglat)
+    {
+        $config = self::getPluginConfig();
+        $key = trim((string)($config['amap_key'] ?? ''));
+        if ($key === '') {
+            return '';
+        }
+        $url = 'https://restapi.amap.com/v3/geocode/regeo?key=' . urlencode($key)
+             . '&location=' . urlencode($lnglat) . '&extensions=all&output=json';
+        $ctx = stream_context_create(['http' => ['timeout' => 5, 'method' => 'GET']]);
+        $json = @file_get_contents($url, false, $ctx);
+        if (!$json) {
+            return '';
+        }
+        $data = @json_decode($json, true);
+        if (!is_array($data) || ($data['status'] ?? '0') !== '1') {
+            return '';
+        }
+        return trim((string)($data['regeocode']['formatted_address'] ?? ''));
+    }
+
+    /**
+     * 读取指定评论的精确位置（per-comment，键 = coid）
+     *
+     * 供显示链路优先使用；无记录返回空串。
+     *
+     * @param int $coid
+     * @return string
+     */
+    public static function getCommentLocation($coid)
+    {
+        $coid = (int) $coid;
+        if ($coid <= 0) {
+            return '';
+        }
+        $cache = self::readCommentLocationCache();
+        return isset($cache[$coid]) ? trim((string) $cache[$coid]) : '';
+    }
+
+    /**
+     * 读取评论位置缓存文件（共享锁）
+     *
+     * @access private
+     * @return array coid => 地址
+     */
+    private static function readCommentLocationCache()
+    {
+        $cacheFile = self::getCommentLocationCacheFile();
+        $cache = [];
+        if (!file_exists($cacheFile)) {
+            return $cache;
+        }
+        $fp = @fopen($cacheFile, 'r');
+        if ($fp) {
+            if (flock($fp, LOCK_SH)) {
+                $data = stream_get_contents($fp);
+                flock($fp, LOCK_UN);
+                if ($data !== false && $data !== '') {
+                    $cache = json_decode($data, true);
+                    if (!is_array($cache)) {
+                        $cache = [];
+                    }
+                }
+            }
+            fclose($fp);
+        }
+        return $cache;
+    }
+
+    /**
+     * 写入一条评论的精确位置（排他锁内重读合并，上限 5000 条）
+     *
+     * @access private
+     * @param int    $coid    评论 ID
+     * @param string $address 完整地址
+     * @return void
+     */
+    private static function writeCommentLocationCache($coid, $address)
+    {
+        $cacheFile = self::getCommentLocationCacheFile();
+        $dir = dirname($cacheFile);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0755, true);
+        }
+        $fp = @fopen($cacheFile, 'c+');
+        if (!$fp) {
+            return;
+        }
+        if (flock($fp, LOCK_EX)) {
+            $data = stream_get_contents($fp);
+            $cache = $data !== false && $data !== '' ? json_decode($data, true) : [];
+            if (!is_array($cache)) {
+                $cache = [];
+            }
+            $cache[$coid] = $address;
+            if (count($cache) > 5000) {
+                $cache = array_slice($cache, -4000, 4000, true);
+            }
+            $json = json_encode($cache, JSON_UNESCAPED_UNICODE);
+            ftruncate($fp, 0);
+            rewind($fp);
+            fwrite($fp, $json);
+            fflush($fp);
+            flock($fp, LOCK_UN);
+        }
+        fclose($fp);
+    }
+
+    private static function getCommentLocationCacheFile()
+    {
+        return __DIR__ . '/cache/comment_locations.json';
+    }
+
+    // =========================================================================
     //  邮件通知
     // =========================================================================
 
@@ -798,6 +1066,37 @@ EOS);
     public static function doComment($comment)
     {
         self::sendMail($comment->coid);
+        self::resolveGeoLocation($comment->coid);
+    }
+
+    /**
+     * 解析评论者浏览器精确定位并持久化（per-comment）
+     *
+     * 前端提交的 hidden 字段 bc_lnglat（经度,纬度）→ 正则校验 →
+     * 高德 regeo 反地理编码 → 完整地址写入评论位置缓存。任何环节失败
+     * 均静默跳过，不影响评论提交本身。
+     *
+     * @param int $coid 评论 ID
+     * @return void
+     */
+    private static function resolveGeoLocation($coid)
+    {
+        if (!self::isGeoEnabled()) {
+            return;
+        }
+        $coid = (int) $coid;
+        if ($coid <= 0) {
+            return;
+        }
+        $lnglat = trim((string) ($_POST['bc_lnglat'] ?? ''));
+        if ($lnglat === '' || !preg_match('/^[-+]?\d{1,3}(?:\.\d+)?,[-+]?\d{1,3}(?:\.\d+)?$/', $lnglat)) {
+            return;
+        }
+        $address = self::queryAmap($lnglat);
+        if ($address === '') {
+            return;
+        }
+        self::writeCommentLocationCache($coid, $address);
     }
 
     /**
